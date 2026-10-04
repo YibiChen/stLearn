@@ -157,6 +157,8 @@ class TestRunCCISingleCell(unittest.TestCase):
         # Directed: senders are A cells (ligand), receivers B cells (receptor).
         self.assertGreater(raw.loc["A", "B"], 0)
         self.assertEqual(raw.loc["B", "A"], 0)
+        enrich = adata.uns["per_lr_cci_enrichment_cell_type"]["LA_RB"]
+        self.assertGreater(enrich.loc["A", "B"], 1.0)
         null = adata.uns["cci_sc_null_cell_type"]
         self.assertLess(null["null_max_abs_gap"].max(), 0.011)
 
@@ -206,4 +208,8 @@ class TestTorchDevice(unittest.TestCase):
         pd.testing.assert_frame_equal(
             adata.uns["per_lr_cci_pvals_cell_type"]["LA_RB"],
             torch_adata.uns["per_lr_cci_pvals_cell_type"]["LA_RB"],
+        )
+        pd.testing.assert_frame_equal(
+            adata.uns["per_lr_cci_enrichment_cell_type"]["LA_RB"],
+            torch_adata.uns["per_lr_cci_enrichment_cell_type"]["LA_RB"],
         )

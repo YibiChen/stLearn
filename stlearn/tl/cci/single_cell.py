@@ -379,7 +379,11 @@ def run_sc(
     # Keep LRs whose genes are both measured.
     pairs = [lr.split("_") for lr in lrs]
     present = [(lig in gene_index and rec in gene_index) for lig, rec in pairs]
+    n_input = len(lrs)
     lrs = lrs[np.array(present, dtype=bool)] if len(lrs) else lrs
+    if verbose:
+        # Targeted panels (a few hundred genes) cover few database LR pairs.
+        print(f"{len(lrs)} of {n_input} LR pairs have both genes measured.")
     lr_genes = {g for lr in lrs for g in lr.split("_")}
 
     # Observed scores, filtering LRs with too few sender cells.
@@ -566,9 +570,10 @@ def run_sc(
 @njit(parallel=True, cache=True)
 def _null_counts_ge(src, dst, perms, observed, n_types):  # pragma: no cover - numba
     """Count surrogate labellings whose sender->receiver type counts are >= the
-    observed counts."""
+    observed counts, and sum the surrogate counts (for the null mean)."""
     n_perms = perms.shape[0]
     ge = np.zeros((n_perms, n_types, n_types), dtype=np.int64)
+    tot = np.zeros((n_perms, n_types, n_types), dtype=np.int64)
     for p in prange(n_perms):
         counts = np.zeros((n_types, n_types), dtype=np.int64)
         lab = perms[p]
@@ -578,10 +583,13 @@ def _null_counts_ge(src, dst, perms, observed, n_types):  # pragma: no cover - n
             for b in range(n_types):
                 if counts[a, b] >= observed[a, b]:
                     ge[p, a, b] = 1
+        tot[p] = counts
     out = np.zeros((n_types, n_types), dtype=np.int64)
+    total = np.zeros((n_types, n_types), dtype=np.int64)
     for p in range(n_perms):
         out += ge[p]
-    return out
+        total += tot[p]
+    return out, total
 
 
 def run_cci_sc(
@@ -612,6 +620,14 @@ def run_cci_sc(
     radius graph (Arthur 2025), so cell types that sit in large patches are not
     called interacting just because they cluster. The same surrogates are
     reused for every LR.
+
+    Both nulls move labels away from expression, so a pair is significant
+    whenever its sender type expresses L and its receiver type R and the two
+    are adjacent; with cell type specific genes most such pairs pass. Rank
+    them by the stored enrichment. In imaging data, transcripts from one cell
+    are often assigned to the touching cell (segmentation spillover), so
+    low-level L or R in a cell next to a high expresser of another type can
+    create apparent senders or receivers of that type.
 
     Parameters
     ----------
@@ -660,6 +676,10 @@ def run_cci_sc(
         adata.uns[f"lr_cci_{use_label}"], [f"lr_cci_raw_{use_label}"]
         adata.uns[f"per_lr_cci_{use_label}"], [f"per_lr_cci_pvals_{use_label}"],
             [f"per_lr_cci_raw_{use_label}"]
+        adata.uns[f"per_lr_cci_enrichment_{use_label}"]: per LR, observed edge
+            count over the mean surrogate count, (obs + 1) / (null mean + 1).
+            On large tissues most tested pairs reach the minimum p-value, so
+            use this to rank significant pairs.
         adata.uns[f"cci_sc_null_{use_label}"]: observed and surrogate Moran's I
             per cell type, to check the null reproduced the clustering.
     """
@@ -729,6 +749,7 @@ def run_cci_sc(
     all_matrix = np.zeros((n_types, n_types), dtype=np.int64)
     raw_matrix = np.zeros((n_types, n_types), dtype=np.int64)
     per_lr_cci, per_lr_cci_pvals, per_lr_cci_raw = {}, {}, {}
+    per_lr_cci_enrich = {}
     n_edges = np.zeros(len(lrs))
     n_edges_sig = np.zeros(len(lrs))
     n_cci_sig = np.zeros(len(lrs))
@@ -749,12 +770,17 @@ def run_cci_sc(
             np.fill_diagonal(observed, 0)
         if n_perms > 0 and len(src) > 0:
             if counter is None:
-                n_ge = _null_counts_ge(src, dst, perms, observed, n_types)
+                n_ge, null_sum = _null_counts_ge(src, dst, perms, observed, n_types)
             else:
-                n_ge = counter.ge_counts(src, dst, observed)
+                n_ge, null_sum = counter.ge_counts(src, dst, observed)
             pvals = (n_ge + 1) / (n_perms + 1)
+            null_mean = null_sum / n_perms
         else:
             pvals = np.ones((n_types, n_types))
+            null_mean = np.zeros((n_types, n_types))
+        # With 1e5+ cells most tested pairs reach the smallest attainable
+        # p-value, so the enrichment over the null is what ranks them.
+        enrichment = (observed + 1) / (null_mean + 1)
         pvals[observed == 0] = 1.0
         if different_cell_types:
             np.fill_diagonal(pvals, 1.0)
@@ -772,6 +798,7 @@ def run_cci_sc(
         per_lr_cci[lr] = pd.DataFrame(sig_matrix, index=all_set, columns=all_set)
         per_lr_cci_pvals[lr] = pd.DataFrame(pvals, index=all_set, columns=all_set)
         per_lr_cci_raw[lr] = pd.DataFrame(observed, index=all_set, columns=all_set)
+        per_lr_cci_enrich[lr] = pd.DataFrame(enrichment, index=all_set, columns=all_set)
 
     lr_summary[f"n_cci_sig_{use_label}"] = n_cci_sig
     lr_summary[f"n-spot_cci_{use_label}"] = n_edges
@@ -786,6 +813,7 @@ def run_cci_sc(
     adata.uns[f"per_lr_cci_{use_label}"] = per_lr_cci
     adata.uns[f"per_lr_cci_pvals_{use_label}"] = per_lr_cci_pvals
     adata.uns[f"per_lr_cci_raw_{use_label}"] = per_lr_cci_raw
+    adata.uns[f"per_lr_cci_enrichment_{use_label}"] = per_lr_cci_enrich
     adata.uns[f"cci_sc_null_{use_label}"] = pd.DataFrame(
         {
             "observed_morans_i": observed_i,

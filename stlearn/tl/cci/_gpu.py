@@ -79,7 +79,8 @@ def count_bg_greater(
 
 class EdgeCounter:
     """Keeps surrogate labellings on the device and counts, for a set of
-    directed edges, how many surrogates give type pair counts >= observed."""
+    directed edges, how many surrogates give type pair counts >= observed, and
+    the summed surrogate counts."""
 
     def __init__(self, perms: npt.NDArray[np.integer], n_types: int, dev):
         import torch
@@ -93,7 +94,7 @@ class EdgeCounter:
         src: npt.NDArray[np.int64],
         dst: npt.NDArray[np.int64],
         observed: npt.NDArray[np.int64],
-    ) -> npt.NDArray[np.int64]:
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]:
         import torch
 
         k2 = self.n_types * self.n_types
@@ -102,6 +103,7 @@ class EdgeCounter:
         dst_t = torch.as_tensor(dst, device=self.dev)
         obs_t = torch.as_tensor(observed.ravel(), device=self.dev)
         total = torch.zeros(k2, dtype=torch.int64, device=self.dev)
+        summed = torch.zeros(k2, dtype=torch.int64, device=self.dev)
         batch = max(1, _MAX_ELEMENTS // max(len(src), 1))
         for start in range(0, n_perms, batch):
             labs = self.perms[start : start + batch]
@@ -112,4 +114,9 @@ class EdgeCounter:
                 (pair + offsets).ravel(), minlength=n_b * k2
             ).reshape(n_b, k2)
             total += (counts >= obs_t[None, :]).sum(dim=0)
-        return total.cpu().numpy().reshape(self.n_types, self.n_types)
+            summed += counts.sum(dim=0)
+        shape = (self.n_types, self.n_types)
+        return (
+            total.cpu().numpy().reshape(shape),
+            summed.cpu().numpy().reshape(shape),
+        )
