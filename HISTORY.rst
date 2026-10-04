@@ -2,6 +2,15 @@
 History
 =======
 
+Unreleased
+----------
+* Single-cell resolution CCI for Xenium, Atera and similar platforms:
+  ``st.tl.cci.run_sc`` (directed sender-to-receiver LR scores between different
+  cells within a user-chosen radius, tested against expression-matched random
+  gene pairs, with an optional global test against spatially autocorrelated
+  surrogate genes) and ``st.tl.cci.run_cci_sc`` (cell type pair testing against
+  surrogate labellings that keep each cell type's Moran's I, after Arthur 2025).
+
 1.4.1 (2026-06-16)
 ------------------
 * Improved speed of random spot generation used in permutation testing.
