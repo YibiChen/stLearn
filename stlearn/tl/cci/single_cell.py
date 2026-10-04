@@ -34,6 +34,7 @@ from scipy.spatial import cKDTree
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 
+from . import _gpu
 from .perm_utils import gen_rand_pairs
 from .spatial_null import permute_labels, permute_values
 
@@ -254,6 +255,7 @@ def run_sc(
     correct_axis: str | None = "cell",
     pval_adj_cutoff: float = 0.05,
     quantiles: tuple[float, ...] = (0.25, 0.5, 0.75, 0.9, 0.95, 0.99),
+    device: str | None = None,
     n_cpus: int | None = None,
     random_state: int = 0,
     verbose: bool = True,
@@ -312,6 +314,10 @@ def run_sc(
         Adjusted p-value below which a cell is significant for an LR.
     quantiles: tuple
         Non-zero expression quantiles used to match random genes.
+    device: str | None
+        None (default) counts random gene pairs with numba on the CPU. 'auto',
+        'cuda', 'cuda:N' or 'mps' run this step with torch on a GPU ('auto'
+        falls back to the CPU if none is found).
     n_cpus: int | None
         Threads to use; all if None.
     random_state: int
@@ -333,6 +339,7 @@ def run_sc(
         adata.uns['cci_sc_params']: the settings used.
     """
     _set_threads(n_cpus)
+    dev = _gpu.resolve_device(device)
     lrs = np.asarray(lrs).astype(str)
     if n_pairs < 100:
         raise ValueError("n_pairs must be >= 100 for a usable background.")
@@ -444,9 +451,20 @@ def run_sc(
             )
             obs = send_scores[:, j].toarray().ravel()
             cells = np.where(obs > 0)[0]
-            n_ge = _count_bg_greater(
-                obs, cells.astype(np.int64), lig_bg, rec_bg, pair_l, pair_r, min_expr
-            )
+            if dev is None:
+                n_ge = _count_bg_greater(
+                    obs,
+                    cells.astype(np.int64),
+                    lig_bg,
+                    rec_bg,
+                    pair_l,
+                    pair_r,
+                    min_expr,
+                )
+            else:
+                n_ge = _gpu.count_bg_greater(
+                    obs, cells, lig_bg, rec_bg, pair_l, pair_r, min_expr, dev
+                )
             test_cells.append(cells)
             test_lrs.append(np.full(len(cells), j))
             test_pvals.append((n_ge + 1) / (n_pairs + 1))
@@ -579,6 +597,7 @@ def run_cci_sc(
     eps: float = 0.01,
     init: str = "smooth",
     max_proposals_per_cell: int = 200,
+    device: str | None = None,
     n_cpus: int | None = None,
     random_state: int = 0,
     verbose: bool = True,
@@ -619,6 +638,11 @@ def run_cci_sc(
     eps, init, max_proposals_per_cell:
         Passed to the spatial resampler, see
         stlearn.tl.cci.spatial_null.permute_labels.
+    device: str | None
+        None (default) counts edges under each surrogate with numba on the
+        CPU; 'auto', 'cuda', 'cuda:N' or 'mps' use torch on a GPU. Generating
+        the spatial surrogates is a sequential swap chain and stays on the CPU
+        (parallel across surrogates).
     n_cpus: int | None
         Threads to use; all if None.
     random_state: int
@@ -640,6 +664,7 @@ def run_cci_sc(
             per cell type, to check the null reproduced the clustering.
     """
     _set_threads(n_cpus)
+    dev = _gpu.resolve_device(device)
     if "lr_summary" not in adata.uns or GRAPH_KEY not in adata.obsp:
         raise ValueError("Run st.tl.cci.run_sc first.")
     if use_label not in adata.obs:
@@ -684,6 +709,7 @@ def run_cci_sc(
                 f"{list(bad)}; consider a larger max_proposals_per_cell."
             )
 
+    counter = None if dev is None else _gpu.EdgeCounter(perms, n_types, dev)
     graph = sp.csr_matrix(adata.obsp[GRAPH_KEY])
     expr = adata.layers[layer] if layer is not None else adata.X
     expr_csc = sp.csc_matrix(expr, dtype=np.float64)
@@ -722,7 +748,10 @@ def run_cci_sc(
         if different_cell_types:
             np.fill_diagonal(observed, 0)
         if n_perms > 0 and len(src) > 0:
-            n_ge = _null_counts_ge(src, dst, perms, observed, n_types)
+            if counter is None:
+                n_ge = _null_counts_ge(src, dst, perms, observed, n_types)
+            else:
+                n_ge = counter.ge_counts(src, dst, observed)
             pvals = (n_ge + 1) / (n_perms + 1)
         else:
             pvals = np.ones((n_types, n_types))
@@ -769,4 +798,91 @@ def run_cci_sc(
         print(
             f"Stored directed (sender x receiver) results in "
             f"adata.uns['per_lr_cci_{use_label}'] and related keys."
+        )
+
+
+def smooth_expression(
+    adata: AnnData,
+    use_label: str,
+    radius: float,
+    sigma: float | None = None,
+    self_weight: float = 1.0,
+    spatial_key: str = "spatial",
+    coord_scale: float = 1.0,
+    layer: str | None = None,
+    key_added: str = "smoothed",
+    verbose: bool = True,
+) -> None:
+    """Smooth expression over nearby cells of the same type to reduce dropout.
+
+    Each cell's expression becomes a weighted average of itself and the cells
+    of the same type within radius, with Gaussian weights
+    ``exp(-d^2 / (2 sigma^2))`` on the centroid distance d. The cell itself
+    gets self_weight (1.0 is the kernel value at d = 0). Restricting the
+    average to the same cell type keeps a ligand made by one type from being
+    spread onto neighbouring cells of another type, so sender and receiver
+    identities in run_sc stay intact.
+
+    Use the result with ``st.tl.cci.run_sc(..., layer=key_added)``. The random
+    gene pairs are then drawn from the same smoothed layer, so the per-cell
+    test compares like with like. Smoothing does raise spatial
+    autocorrelation, so keep the radius small (about one to two cell
+    diameters) and prefer the spatial nulls when testing.
+
+    Parameters
+    ----------
+    adata: AnnData
+        Cells x genes.
+    use_label: str
+        Cell type column in adata.obs.
+    radius: float
+        Neighbourhood radius in coordinate units (microns for Xenium/Atera).
+    sigma: float | None
+        Gaussian kernel width; defaults to radius / 2.
+    self_weight: float
+        Weight of the cell's own expression before row normalisation.
+    spatial_key, coord_scale:
+        As in run_sc.
+    layer: str | None
+        Expression layer to smooth instead of adata.X.
+    key_added: str
+        Smoothed matrix is stored in adata.layers[key_added].
+    verbose: bool
+        Print a summary.
+    """
+    if use_label not in adata.obs:
+        raise ValueError(f"{use_label} not found in adata.obs.")
+    sigma = radius / 2 if sigma is None else sigma
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0.")
+    coords = get_coordinates(adata, spatial_key, coord_scale)
+    n = coords.shape[0]
+    pairs = cKDTree(coords).query_pairs(radius, output_type="ndarray")
+    codes = pd.Categorical(adata.obs[use_label]).codes
+    pairs = pairs[codes[pairs[:, 0]] == codes[pairs[:, 1]]]
+    dist2 = ((coords[pairs[:, 0]] - coords[pairs[:, 1]]) ** 2).sum(axis=1)
+    w = np.exp(-dist2 / (2 * sigma**2))
+    rows = np.concatenate([pairs[:, 0], pairs[:, 1], np.arange(n)])
+    cols = np.concatenate([pairs[:, 1], pairs[:, 0], np.arange(n)])
+    vals = np.concatenate([w, w, np.full(n, self_weight)])
+    weights = _row_normalise(sp.csr_matrix((vals, (rows, cols)), shape=(n, n)))
+
+    expr = adata.layers[layer] if layer is not None else adata.X
+    if sp.issparse(expr):
+        smoothed = sp.csr_matrix(weights @ sp.csr_matrix(expr))
+    else:
+        smoothed = weights @ np.asarray(expr)
+    adata.layers[key_added] = smoothed
+    adata.uns[f"{key_added}_params"] = {
+        "use_label": use_label,
+        "radius": float(radius),
+        "sigma": float(sigma),
+        "self_weight": float(self_weight),
+        "layer": layer,
+    }
+    if verbose:
+        n_neigh = np.diff(weights.indptr) - 1
+        print(
+            f"Smoothed over a median of {int(np.median(n_neigh))} same-type "
+            f"neighbours; stored in adata.layers['{key_added}']."
         )

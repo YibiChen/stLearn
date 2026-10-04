@@ -159,3 +159,51 @@ class TestRunCCISingleCell(unittest.TestCase):
         self.assertEqual(raw.loc["B", "A"], 0)
         null = adata.uns["cci_sc_null_cell_type"]
         self.assertLess(null["null_max_abs_gap"].max(), 0.011)
+
+
+class TestSmoothing(unittest.TestCase):
+    def test_same_type_distance_weighted(self):
+        coords = np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0], [2.0, 0.0]])
+        labels = ["A", "A", "A", "B"]
+        expr = np.array([[1.0], [3.0], [5.0], [100.0]])
+        adata = AnnData(
+            expr,
+            obs=pd.DataFrame(
+                {"cell_type": pd.Categorical(labels)},
+                index=[f"c{i}" for i in range(4)],
+            ),
+        )
+        adata.obsm["spatial"] = coords
+        st.tl.cci.smooth_expression(
+            adata, "cell_type", radius=5, sigma=4, verbose=False
+        )
+        out = np.asarray(adata.layers["smoothed"]).ravel()
+        w = np.exp(-16 / 32)
+        # Cell 0 averages itself and cell 1 (4 apart), never the B cell.
+        self.assertAlmostEqual(out[0], (1.0 + 3.0 * w) / (1 + w))
+        # Cell 1 averages cells 0 and 2 symmetrically.
+        self.assertAlmostEqual(out[1], (3.0 + w * (1.0 + 5.0)) / (1 + 2 * w))
+        # The lone B cell keeps its own value.
+        self.assertAlmostEqual(out[3], 100.0)
+
+
+class TestTorchDevice(unittest.TestCase):
+    def test_torch_matches_numba(self):
+        adata, lrs = make_tissue(n=1500)
+        torch_adata = adata.copy()
+        st.tl.cci.run_sc(adata, lrs, radius=30, n_pairs=200, verbose=False)
+        st.tl.cci.run_sc(
+            torch_adata, lrs, radius=30, n_pairs=200, device="cpu", verbose=False
+        )
+        np.testing.assert_allclose(
+            adata.obsm["-log10(p_vals)"].toarray(),
+            torch_adata.obsm["-log10(p_vals)"].toarray(),
+        )
+        for a, null in ((adata, None), (torch_adata, "cpu")):
+            st.tl.cci.run_cci_sc(
+                a, "cell_type", n_perms=20, null="random", device=null, verbose=False
+            )
+        pd.testing.assert_frame_equal(
+            adata.uns["per_lr_cci_pvals_cell_type"]["LA_RB"],
+            torch_adata.uns["per_lr_cci_pvals_cell_type"]["LA_RB"],
+        )

@@ -10,6 +10,10 @@ Unreleased
   gene pairs, with an optional global test against spatially autocorrelated
   surrogate genes) and ``st.tl.cci.run_cci_sc`` (cell type pair testing against
   surrogate labellings that keep each cell type's Moran's I, after Arthur 2025).
+* ``st.tl.cci.smooth_expression``: distance-weighted smoothing over neighbouring
+  cells of the same type, to reduce dropout before single-cell CCI.
+* ``device=`` option on ``run_sc`` and ``run_cci_sc`` runs the permutation
+  counting with torch on a GPU.
 
 1.4.1 (2026-06-16)
 ------------------
