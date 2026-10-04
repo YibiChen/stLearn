@@ -145,6 +145,7 @@ Tools: `tl`
    tl.cci.run_sc
    tl.cci.run_cci_sc
    tl.cci.smooth_expression
+   tl.cci.filter_spillover
 
 Plot: `pl`
 -------------------

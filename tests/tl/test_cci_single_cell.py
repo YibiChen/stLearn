@@ -213,3 +213,47 @@ class TestTorchDevice(unittest.TestCase):
             adata.uns["per_lr_cci_enrichment_cell_type"]["LA_RB"],
             torch_adata.uns["per_lr_cci_enrichment_cell_type"]["LA_RB"],
         )
+
+
+class TestSpillover(unittest.TestCase):
+    def test_removes_leaked_counts_keeps_own(self):
+        rng = np.random.default_rng(1)
+        n = 4000
+        xy = rng.uniform(0, 600, (n, 2))
+        labels = np.where((xy[:, 0] // 60) % 2 == 0, "A", "B")
+        # Ligand made by A cells; receptor made by every B cell at a low level.
+        own_l = np.where(labels == "A", rng.poisson(10, n), 0)
+        own_r = np.where(labels == "B", rng.poisson(3, n), 0)
+        bg = rng.poisson(1.0, (n, 20))
+        # 10% of the ligand counts of each touching A cell leak into B cells.
+        contacts = radius_graph(xy, 15).tocsr()
+        is_b = labels == "B"
+        from_a = contacts[:, ~is_b] @ own_l[~is_b]
+        leak = np.where(is_b, rng.poisson(0.1 * from_a), 0)
+        counts = np.column_stack([own_l + leak, own_r, bg]).astype(float)
+        adata = AnnData(
+            sp.csr_matrix(counts),
+            obs=pd.DataFrame(
+                {"cell_type": pd.Categorical(labels)},
+                index=[f"c{i}" for i in range(n)],
+            ),
+            var=pd.DataFrame(index=["L", "R"] + [f"G{i}" for i in range(20)]),
+        )
+        adata.obsm["spatial"] = xy
+        st.tl.cci.filter_spillover(adata, "cell_type", radius=15, verbose=False)
+        out = adata.layers["spillover_filtered"].toarray()
+        leaked = is_b & (counts[:, 0] > 0)
+        self.assertGreater(leaked.sum(), 100)
+        # Most leaked ligand counts in B cells are removed.
+        self.assertLess((out[leaked, 0] > 0).mean(), 0.2)
+        # A cells keep their ligand and B cells their receptor.
+        own_a = ~is_b & (counts[:, 0] > 0)
+        self.assertGreater((out[own_a, 0] > 0).mean(), 0.95)
+        own_b = is_b & (counts[:, 1] > 0)
+        self.assertGreater((out[own_b, 1] > 0).mean(), 0.7)
+        self.assertAlmostEqual(adata.var.loc["L", "spillover_filtered_alpha"], 0.1, 1)
+
+    def test_requires_counts(self):
+        adata, _ = make_tissue(n=200)
+        with self.assertRaises(ValueError):
+            st.tl.cci.filter_spillover(adata, "cell_type", verbose=False)
