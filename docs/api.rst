@@ -142,6 +142,10 @@ Tools: `tl`
    tl.cci.adj_pvals
    tl.cci.run_lr_go
    tl.cci.run_cci
+   tl.cci.run_sc
+   tl.cci.run_cci_sc
+   tl.cci.smooth_expression
+   tl.cci.filter_spillover
 
 Plot: `pl`
 -------------------
