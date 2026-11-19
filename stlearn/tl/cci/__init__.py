@@ -3,6 +3,7 @@ from .analysis import adj_pvals, run, run_cci, run_lr_go
 from .edges import get_edges
 from .gridding import create_grid, grid
 from .ligand_receptors import LRPairs, load_lrs, lr_pairs, read_lr_pairs
+from .potential import run_cci_potential
 
 __all__ = [
     "LR_FEATURES",
@@ -19,5 +20,6 @@ __all__ = [
     "read_lr_pairs",
     "run",
     "run_cci",
+    "run_cci_potential",
     "run_lr_go",
 ]
